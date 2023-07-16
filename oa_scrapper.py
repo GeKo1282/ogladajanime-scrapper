@@ -93,6 +93,7 @@ class SeriesFetcher:
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.131 Safari/537.36',
             'Origin': 'https://ogladajanime.pl',
+            'Cookie': 'user_id=64918; user_key=ZMWA6qGdsQ5k28zKr4KIP2wpLWpTrN',
         }
         self.proxies: List[str] = working_proxy_list
 
@@ -229,6 +230,7 @@ class SeriesFetcher:
         try:
             main_url = episode_json[0]["mainUrl"]
         except:
+            print(episode_json)
             return None
 
         if self.proxies:
