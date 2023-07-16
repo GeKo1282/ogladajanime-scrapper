@@ -309,7 +309,7 @@ class Series:
             proxies: List[str], download_threads: int = 30, ignore_all_existing: bool = False, rename_all_existing: bool = False, replace_all_existing: bool = False) -> bool:
         
         self.url: str = url
-        self.output_directory: str = output_directory
+        self.output_directory: str = output_directory.replace("/", "\\")
         self.title_scheme: str = title_scheme
         self.quality: str = quality
 
@@ -342,17 +342,23 @@ class Series:
                 return True
             return False
         
-        os.mkdir(self.output_directory)
+        os.makedirs(self.output_directory)
         return True
     
     def verify_input(self, *, ignore_directory_warning: bool = False):
         if not self.verify_url():
             return "url"
         
-        if not self.make_output_directory() and not ignore_directory_warning:
-            response = self.console_logger.ask(f"Directory \"{self.output_directory}\" already exists and is not empty. Do you want to continue? [y/n]: ")
-            if response.lower() != "y":
-                return "directory"
+        try:
+            if not self.make_output_directory() and not ignore_directory_warning:
+                response = self.console_logger.ask(f"Directory \"{self.output_directory}\" already exists and is not empty. Do you want to continue? [y/n]: ")
+                if response.lower() != "y":
+                    return "directory"
+        except Exception as e:
+            self.full_stop = True
+            self.console_logger.clear()
+            self.console_logger.set_message(0, f"Directory \"{self.output_directory}\" could not be created! Please check if you have permissions to create directories in this location. Exception: {str(e)}")
+            return "directory"
             
         return True
     
@@ -372,7 +378,7 @@ class Series:
 
             episodes_list = soup.find(id="ep_list")
             self.series_title = soup.find(id="anime_name_id").text
-            episodes: dict[int, Episode] = {index: [episode.attrs.get("title"), episode.attrs.get("ep_id"), int(episode.attrs.get("value"))] for index, episode in enumerate(episodes_list.findChildren(recursive=False))}
+            episodes: dict[int, Episode] = {index: [(episode.attrs.get("title") or "No title!"), episode.attrs.get("ep_id"), int(episode.attrs.get("value"))] for index, episode in enumerate(episodes_list.findChildren(recursive=False))}
 
             self.no_episodes = len(episodes)
 
@@ -381,21 +387,24 @@ class Series:
                 if episodes[episode][2] == 0:
                     self.no_episodes -= 1
                     continue
+                
+                try:
+                    json_data = json.loads(requests.get(OA_PLAYER_BASE_URL + episodes[episode][1], proxies={"http": random.choice(self.proxies)}, headers=headers).content.decode("utf-8"))
+                    qualities = {f"{quality['res']}p": quality["src"] for quality in json_data}
+                    self.episodes[episode] = Episode(self, episodes[episode][0], episodes[episode][1], qualities, episodes[episode][2])
 
-                json_data = json.loads(requests.get(OA_PLAYER_BASE_URL + episodes[episode][1], proxies={"http": random.choice(self.proxies)}, headers=headers).content.decode("utf-8"))
-                qualities = {f"{quality['res']}p": quality["src"] for quality in json_data}
-                self.episodes[episode] = Episode(self, episodes[episode][0], episodes[episode][1], qualities, episodes[episode][2])
+                    quality = self.quality
+                    if self.quality == "best":
+                        quality = f"{max([int(key.replace('p', '')) for key in self.episodes[episode].qualities.keys()])}p"
 
-                quality = self.quality
-                if self.quality == "best":
-                    quality = f"{max([int(key.replace('p', '')) for key in self.episodes[episode].qualities.keys()])}p"
+                    while not self.episodes[episode].set_quality(quality):
+                        quality = self.console_logger.ask(f"Episode {episode} of series {self.series_title} does not have quality {quality}. Please pick a new quality: [{','.join([episodes[episode].qualities.keys()])}]: ")
 
-                while not self.episodes[episode].set_quality(quality):
-                    quality = self.console_logger.ask(f"Episode {episode} of series {self.series_title} does not have quality {quality}. Please pick a new quality: [{','.join([episodes[episode].qualities.keys()])}]: ")
-
-                size_getters.append(self.episodes[episode].get_size(random.choice(self.proxies)))
-                self.episodes[episode].set_output(self.output_directory, self.title_scheme)
-                self.episodes[episode].set_quality(quality)
+                    size_getters.append(self.episodes[episode].get_size(random.choice(self.proxies)))
+                    self.episodes[episode].set_output(self.output_directory, self.title_scheme)
+                    self.episodes[episode].set_quality(quality)
+                except:
+                    self.no_episodes -= 1
 
             for getter in size_getters:
                 getter.join()
@@ -416,14 +425,13 @@ class Series:
                     
                 return None
             
-            while len(self.episodes) != self.no_episodes or self.no_episodes == 0 or (self.episodes[get_first_nonignored_episode()].output if get_first_nonignored_episode() else None) == None:
-                if all([self.episodes[episode].ignore for episode in [*list(self.episodes.keys())]]) and len(self.episodes) == self.no_episodes and self.no_episodes != 0:
+            while (len(self.episodes) != self.no_episodes or self.no_episodes == 0 or get_first_nonignored_episode() == None or self.episodes[get_first_nonignored_episode()].output == None) or \
+             self.episodes[get_first_nonignored_episode()].size == 0:
+                if self.full_stop or (self.no_episodes != 0 and len(self.episodes) == self.no_episodes and all([self.episodes[episode].ignore for episode in [*list(self.episodes.keys())]])):
                     self.full_stop = True
                     return
+                
                 await asyncio.sleep(0.1)
-
-            while self.episodes[get_first_nonignored_episode()].size == 0:
-                await asyncio.sleep(0.1) # wait for first episode to get size for downloading to start with first episode
 
             while len(self.episodes) != self.no_episodes or self.no_episodes == 0 or not all([(self.episodes[episode].downloaded == self.episodes[episode].size and self.episodes[episode].size > 0) or self.episodes[episode].ignore for episode in [*list(self.episodes.keys())]]):
                 if self.full_stop:
@@ -453,7 +461,7 @@ class Series:
 
                         self.episodes[key].downloaded += len(data)
                         self.episodes[key].to_save[chunk_index] = data
-      
+
         async def saver():
             while len(self.episodes) != self.no_episodes or self.no_episodes == 0 or not all([(self.episodes[episode].downloaded == self.episodes[episode].size and self.episodes[episode].size > 0 and len(self.episodes[episode].to_save) == 0) or self.episodes[episode].ignore for episode in [*list(self.episodes.keys())]]) or len(self.episodes) == 0:
                 if self.full_stop:
@@ -494,17 +502,19 @@ class Series:
                 return sum([episode.size for episode in self.episodes.values() if not episode.ignore])
             
             message = "Series stats:"
-            message += f"\n\tTotal size of all {len(self.episodes)} episodes is: {convert_size(sum([episode.size for episode in self.episodes.values()]))}."
+            message += f"\n\tSeries title is \"{self.series_title}\"."
+            message += f"\n\tDetected {self.no_episodes} episodes."
             message += f"\n\tDesired quality is \"{self.quality}\"."
+            message += f"\n\tTotal size of all {len(self.episodes)} episodes is: {convert_size(sum([episode.size for episode in self.episodes.values()]))}."
             message += f"\n\tTotal size of {sum([0 if episode.ignore else 1 for episode in self.episodes.values()])} downloaded episodes is: {convert_size(get_size_of_nonignored_episodes())}."
-            message += f"\n\nDownloading \"{self.series_title}\" to \"{self.output_directory}\""
+            message += f"\n\tDownloading to \"" + self.output_directory.replace("\\", " >> ") + "\" directory."
             message += "\n\nFollowing episodes are being downloaded:"
 
             item_index = 1
             for episode in self.episodes.values():
                 if episode.ignore:
                     continue
-                message += f"\n{f'0{item_index}'[-2:]}. Episode {f'0{episode.real_index}'[-2:]}: {const_title_length(episode.title, 45)} {make_progressbar(episode.downloaded, episode.size)} [{episode.quality}] {convert_size(episode.downloaded)}/{convert_size(episode.size)}"
+                message += f"\n{f'0{item_index}'[-2:]}. Ep. {f'0{episode.real_index}'[-2:]}: {const_title_length(episode.title, 44)} {make_progressbar(episode.downloaded, episode.size)} {(episode.downloaded / (episode.size or 1) * 100):.2f}% {convert_size(episode.downloaded)}/{convert_size(episode.size)} [{episode.quality}]"
                 item_index += 1
 
             return message
