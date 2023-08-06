@@ -568,7 +568,7 @@ class Series:
             
             def calculate_eta():
                 global timer
-                download_progress = self.total_downloaded / (self.total_size or 1)
+                download_progress = self.total_downloaded / (get_size_of_nonignored_episodes() or 1)
                 seconds_to_finish = int((1 - download_progress) / (download_progress or 1) * (timer - self.timer_start_download))
                 return str(timedelta(seconds=seconds_to_finish))
             
