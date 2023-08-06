@@ -1,9 +1,55 @@
-import os, sys, json, random, threading, asyncio, concurrent
+import os, sys, json, random, threading, asyncio, pathlib
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timedelta
 from urllib.parse import unquote
-from typing import List, Union, Tuple, Optional
+from typing import List, Union, Tuple
+
+class Color:
+    BLACK = 0
+    RED = 1
+    GREEN = 2
+    YELLOW = 3
+    BLUE = 4
+    MAGENTA = 5
+    CYAN = 6
+    WHITE = 7
+    RESET = "\033[0m"
+
+    FORE_GEN = lambda fore: "\033[" + "3" + str(fore) + "m"
+    BACK_GEN = lambda back: "\033[" + "4" + str(back) + "m"
+    FORE_RGB = lambda r, g, b: "\033[38;2;" + str(r) + ";" + str(g) + ";" + str(b) + "m"
+    DECORATION = lambda dec: "\033[" + str(dec) + "m"
+
+
+class Fore:
+    BLACK = Color.FORE_GEN(Color.BLACK)
+    RED = Color.FORE_GEN(Color.RED)
+    GREEN = Color.FORE_GEN(Color.GREEN)
+    YELLOW = Color.FORE_GEN(Color.YELLOW)
+    BLUE = Color.FORE_GEN(Color.BLUE)
+    MAGENTA = Color.FORE_GEN(Color.MAGENTA)
+    CYAN = Color.FORE_GEN(Color.CYAN)
+    WHITE = Color.FORE_RGB(170, 170, 170)
+    GRAY = Color.FORE_RGB(70, 70, 70)
+    LIGHT_GRAY = Color.FORE_RGB(120, 120, 120)
+
+    ORANGE = Color.FORE_RGB(255, 120, 0)
+    PINK = Color.FORE_RGB(219, 79, 123)
+    MINT = Color.FORE_RGB(42, 189, 110)
+
+    UNDERLINE = Color.DECORATION(4)
+
+
+class Back:
+    BLACK = Color.BACK_GEN(Color.BLACK)
+    RED = Color.BACK_GEN(Color.RED)
+    GREEN = Color.BACK_GEN(Color.GREEN)
+    YELLOW = Color.BACK_GEN(Color.YELLOW)
+    BLUE = Color.BACK_GEN(Color.BLUE)
+    MAGENTA = Color.BACK_GEN(Color.MAGENTA)
+    CYAN = Color.BACK_GEN(Color.CYAN)
+    WHITE = Color.BACK_GEN(Color.WHITE)
 
 arglist = {
     "value_arguments": {
@@ -21,6 +67,12 @@ arglist = {
         "ignore_directory_warning": [["--ignore-directory-warning", "-idw"], "Ignores warning about directory existing and not being empty."],
     }
 }
+
+timer = 0
+SPEED_TIMER_ROUND = 10
+last_downloaded_amount = 0
+last_round_speed = 0
+speed_already_calculated = False
 
 def convert_size(bytes: int, precision: int = 2, no_suffix: bool = False) -> str:
     suffixes = ['B', 'KB', 'MB', 'GB', 'TB']
@@ -261,6 +313,7 @@ class Episode:
                         self.chunks = []
                         for index, chunk_start in enumerate(range(0, new_size, 1024*1024)):
                             self.chunks.append((index, (chunk_start, chunk_start + 1024*1024)))
+                        self.series.total_size = self.series.total_size - self.size + new_size
                         self.size = new_size
 
                     return new_size
@@ -317,6 +370,11 @@ class Series:
         self.no_episodes: int = 0
 
         self.episodes: dict[int, Episode] = {}
+        
+        self.total_size: int = 0
+        self.total_nonignored_size: int = 0
+        self.total_downloaded: int = 0
+        self.timer_start_download: int = 0
 
         self.datetime_format: str = datetime_format
         self.series_index: int = series_index
@@ -416,7 +474,9 @@ class Series:
         return thread
 
 
-    def start_downloader(self) -> List[threading.Thread]:        
+    def start_downloader(self) -> List[threading.Thread]:
+        global timer
+        self.timer_start_download = timer       
         async def downloader():
             def get_first_nonignored_episode() -> int:
                 for episode in self.episodes:
@@ -460,6 +520,7 @@ class Series:
                                 await asyncio.sleep(1)
 
                         self.episodes[key].downloaded += len(data)
+                        self.total_downloaded += len(data)
                         self.episodes[key].to_save[chunk_index] = data
 
         async def saver():
@@ -494,27 +555,42 @@ class Series:
                 else:
                     return title + " " * (length - len(title))
 
-            def make_progressbar(value, max_value, length=30):
-                progress = round(value / (max_value or 1) * (length - 2))
-                return f"[{'=' * progress}{' ' * ((length - 2) - progress)}]"
+            def make_progressbar(value, max_value, *, length=30, filled_color=Fore.GREEN, empty_color=Fore.GRAY, character="━"):
+                progress_percentage = value / (max_value or 1)
+
+                full_characters = character * int(progress_percentage * length)
+                empty_characters = (character * length)[len(full_characters):]
+
+                return f"{filled_color}{full_characters}{empty_color}{empty_characters}{Color.RESET}"
             
             def get_size_of_nonignored_episodes() -> int:                
                 return sum([episode.size for episode in self.episodes.values() if not episode.ignore])
             
+            def calculate_eta():
+                global timer
+                download_progress = self.total_downloaded / (self.total_size or 1)
+                seconds_to_finish = int((1 - download_progress) / (download_progress or 1) * (timer - self.timer_start_download))
+                return str(timedelta(seconds=seconds_to_finish))
+            
+            nonignored_size = get_size_of_nonignored_episodes()
+            
             message = "Series stats:"
-            message += f"\n\tSeries title is \"{self.series_title}\"."
-            message += f"\n\tDetected {self.no_episodes} episodes."
-            message += f"\n\tDesired quality is \"{self.quality}\"."
-            message += f"\n\tTotal size of all {len(self.episodes)} episodes is: {convert_size(sum([episode.size for episode in self.episodes.values()]))}."
-            message += f"\n\tTotal size of {sum([0 if episode.ignore else 1 for episode in self.episodes.values()])} downloaded episodes is: {convert_size(get_size_of_nonignored_episodes())}."
-            message += f"\n\tDownloading to \"" + self.output_directory.replace("\\", " >> ") + "\" directory."
+            message += f"\n\tSeries title is {Fore.LIGHT_GRAY}\"{Fore.MINT}{self.series_title}{Fore.LIGHT_GRAY}\"{Color.RESET}."
+            message += f"\n\tSeries URL is {Fore.LIGHT_GRAY}\"{Fore.MINT}{self.url}{Color.RESET}{Fore.LIGHT_GRAY}\"{Color.RESET}.\n"
+            message += f"\n\tDetected {Fore.PINK}{self.no_episodes}{Color.RESET} episodes."
+            message += f"\n\tDesired quality is {Fore.LIGHT_GRAY}\"{Fore.BLUE}{self.quality}{Fore.LIGHT_GRAY}\"{Color.RESET}.\n"
+            message += f"\n\tTotal size of all {Fore.PINK}{len(self.episodes)}{Color.RESET} episodes is: {Fore.GREEN}{convert_size(self.total_size)}{Color.RESET}."
+            message += f"\n\tTotal size of {Fore.PINK}{sum([0 if episode.ignore else 1 for episode in self.episodes.values()])}{Color.RESET} downloaded episodes is: {Fore.GREEN}{convert_size(nonignored_size)}{Color.RESET}."
+            message += f"\n\tDownloading to {Fore.LIGHT_GRAY}\"{Fore.ORANGE}" + str(pathlib.Path(self.output_directory).resolve()).replace("\\", Fore.RED + f" >> " + Fore.ORANGE) + f"{Fore.LIGHT_GRAY}\"{Color.RESET} directory.\n"
+            message += f"\n\t{Fore.ORANGE}Download progress: {Color.RESET}[" + make_progressbar(self.total_downloaded, nonignored_size, length=100) + f"{Color.RESET}] {Fore.GREEN}{self.total_downloaded / (nonignored_size or 1) * 100:.2f}{Color.RESET}% {Fore.GREEN}{convert_size(self.total_downloaded)}{Color.RESET}/{Fore.BLUE}{convert_size(nonignored_size)}{Color.RESET}"
+            message += f"\n\t{Fore.ORANGE}ETA: {Color.RESET} [{Fore.MAGENTA}{calculate_eta()}{Color.RESET}]\n"
             message += "\n\nFollowing episodes are being downloaded:"
 
             item_index = 1
             for episode in self.episodes.values():
                 if episode.ignore:
                     continue
-                message += f"\n{f'0{item_index}'[-2:]}. Ep. {f'0{episode.real_index}'[-2:]}: {const_title_length(episode.title, 44)} {make_progressbar(episode.downloaded, episode.size)} {(episode.downloaded / (episode.size or 1) * 100):.2f}% {convert_size(episode.downloaded)}/{convert_size(episode.size)} [{episode.quality}]"
+                message += f"\n{f'0{item_index}'[-2:]}. Ep. {f'0{episode.real_index}'[-2:]}: {Fore.MAGENTA}{const_title_length(episode.title, 44)} {Color.RESET}[{make_progressbar(episode.downloaded, episode.size, length=70, empty_color=(Fore.GRAY if episode.downloaded == 0 else Fore.RED))}{Color.RESET}] {Fore.BLUE if episode.downloaded > 0 and episode.downloaded < episode.size else Fore.RED if episode.downloaded == 0 else Fore.GREEN} {(episode.downloaded / (episode.size or 1) * 100):.2f}{Color.RESET}% {Fore.GREEN}{convert_size(episode.downloaded)}{Color.RESET}/{Fore.BLUE}{convert_size(episode.size)} {Color.RESET}[{episode.quality}]"
                 item_index += 1
 
             return message
@@ -531,10 +607,20 @@ class Series:
         
         return threads
 
+def start_timer_tick():
+    async def tick():
+        global timer
+        while True:
+            timer += 1
+            await asyncio.sleep(1)
+
+    threading.Thread(target=asyncio.run, args=(tick(),)).start()
+
 async def main():
+    start_timer_tick()
     args = extract_from_argv()
     console_logger = ConsoleLogger()
-    console_logger.start()
+    console_logger.start(wait_for=.1)
 
     if ["help", True] in args[0]:
         print_help(console_logger)
@@ -631,13 +717,64 @@ async def main():
 
     console_logger.set_message(0, f"Checking {len(proxies)} proxies...", True)
     working_proxies = check_proxies([*proxies], proxy_threads)
-    console_logger.set_message(5, f"Using {len(working_proxies)} working proxies.")
+    console_logger.set_message(5, f"Using {len(working_proxies)} working proxies.\n"
+                                f"Using {download_threads} download threads.\n")
     console_logger.remove_message(0)
     if info_str:
         console_logger.set_message(1, info_str.removesuffix("\n"))
 
-    series_objects: List[Series] = []
+    def get_total_download_progress_and_speed():
+        def make_progressbar(value, max_value, *, length=30, filled_color=Fore.GREEN, empty_color=Fore.GRAY, character="━"):
+            progress_percentage = value / (max_value or 1)
 
+            full_characters = character * int(progress_percentage * length)
+            empty_characters = (character * length)[len(full_characters):]
+
+            return f"{filled_color}{full_characters}{empty_color}{empty_characters}{Color.RESET}"
+
+        def get_size_and_downloaded_of_nonignored_episodes(episodes: List[Episode]) -> int:
+            fsum = 0
+            dsum = 0
+            for episode in episodes:
+                if type(episode) != Episode:
+                    continue
+
+                if episode.ignore:
+                    continue
+
+                fsum += episode.size
+                dsum += episode.downloaded
+            return fsum, dsum
+        
+        def calculate_eta(download_progress: float):
+            global timer
+            seconds_to_finish = int((1 - download_progress) / (download_progress or 1) * timer)
+            return str(timedelta(seconds=seconds_to_finish))
+
+        
+        total_size = 0
+        downloaded_size = 0
+        for series in series_objects:
+            tsize, dsize = get_size_and_downloaded_of_nonignored_episodes(list(series.episodes.values()))
+            total_size += tsize
+            downloaded_size += dsize
+        
+        global timer, last_downloaded_amount, last_round_speed, speed_already_calculated
+        if timer % SPEED_TIMER_ROUND == 0 and not speed_already_calculated:
+            speed_already_calculated = True
+            last_round_speed = (downloaded_size - last_downloaded_amount) / SPEED_TIMER_ROUND
+            last_downloaded_amount = downloaded_size
+        elif timer % SPEED_TIMER_ROUND != 0:
+            speed_already_calculated = False
+
+        return f"{Fore.ORANGE}Running for{Color.RESET}: {Fore.MAGENTA}{str(timedelta(seconds=timer))}\n" + \
+        f"{Fore.ORANGE}Total progress{Color.RESET}: {Color.RESET}[{make_progressbar(downloaded_size, total_size, length=130)}{Color.RESET}] {Fore.GREEN}{downloaded_size / (total_size or 1) * 100:.2f}{Color.RESET}% {Fore.GREEN}{convert_size(downloaded_size)}{Color.RESET}/{Fore.BLUE}{convert_size(total_size)}{Color.RESET}\n" + \
+        f"{Fore.ORANGE}ETA{Color.RESET}: {Color.RESET}[{Fore.MAGENTA}{calculate_eta(downloaded_size / (total_size or 1))}{Color.RESET}]\n" + \
+        f"Average download speed: {Fore.GREEN}{convert_size(downloaded_size / (timer or 1))}/s{Color.RESET} | Average download speed in last {SPEED_TIMER_ROUND}s: {Fore.GREEN}{convert_size(last_round_speed)}/s{Color.RESET}"
+
+    console_logger.set_message(6, lambda: get_total_download_progress_and_speed())
+
+    series_objects: List[Series] = []
     for index, series in enumerate(config["series"]):
         series_object = Series(console_logger, config.get("datetime_format", "%Y-%d-%m %H-%M-%S"), series[0], series[1], series[2], series[3], index, [*proxies], download_threads,
             skip_all_existing, rename_all_existing, overwrite_all_existing)
@@ -656,7 +793,7 @@ async def main():
         series.start_fetcher()
 
     for series in series_objects:
-        console_logger.set_message(6, lambda: f"\nDownloading series {series_objects.index(series) + 1} out of {len(series_objects)} (\"{series.series_title}\")...")
+        console_logger.set_message(7, lambda: f"\nDownloading series {series_objects.index(series) + 1} out of {len(series_objects)} ({Fore.LIGHT_GRAY}\"{Fore.MINT}{series.series_title}{Fore.LIGHT_GRAY}\"{Color.RESET})...")
         for thread in series.start_downloader():
             thread.join()
 
