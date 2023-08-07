@@ -69,9 +69,22 @@ arglist = {
 }
 
 timer = 0
-SPEED_TIMER_ROUND = 10
-last_downloaded_amount = 0
-last_round_speed = 0
+lost_chunks = 0
+SPEED_TIMER_ROUND1 = 10
+SPEED_TIMER_ROUND2 = 60
+SPEED_TIMER_ROUND3 = 300
+SPEED_TIMER_ROUND4 = 900
+SPEED_TIMER_ROUND5 = 3600
+last_downloaded1_amount = 0
+last_downloaded2_amount = 0
+last_downloaded3_amount = 0
+last_downloaded4_amount = 0
+last_downloaded5_amount = 0
+last_round1_speed = 0
+last_round2_speed = 0
+last_round3_speed = 0
+last_round4_speed = 0
+last_round5_speed = 0
 speed_already_calculated = False
 
 def convert_size(bytes: int, precision: int = 2, no_suffix: bool = False) -> str:
@@ -112,15 +125,18 @@ class ConsoleLogger:
             return
         
         for weight in sorted(self.messages.keys()):
-            if callable(self.messages[weight][0]):
-                print(self.messages[weight][0](), end="")
-            else:
-                print(self.messages[weight][0], end="")
+            try:
+                if callable(self.messages[weight][0]):
+                    print(self.messages[weight][0](), end="")
+                else:
+                    print(self.messages[weight][0], end="")
 
-            if self.messages[weight][1]:
-                self.messages[weight][1] = self.loading_sign[(self.loading_sign.index(self.messages[weight][1]) + 1) % len(self.loading_sign)]
-                print(f" {self.messages[weight][1]}", end="")
-            print()
+                if self.messages[weight][1]:
+                    self.messages[weight][1] = self.loading_sign[(self.loading_sign.index(self.messages[weight][1]) + 1) % len(self.loading_sign)]
+                    print(f" {self.messages[weight][1]}", end="")
+                print()
+            except:
+                continue
 
     def ask(self, question: str) -> str:
         rerun = False
@@ -370,6 +386,7 @@ class Series:
         self.no_episodes: int = 0
 
         self.episodes: dict[int, Episode] = {}
+        self.errored_episodes: dict[int, Tuple[int, str, str]] = {}
         
         self.total_size: int = 0
         self.total_nonignored_size: int = 0
@@ -436,19 +453,33 @@ class Series:
 
             episodes_list = soup.find(id="ep_list")
             self.series_title = soup.find(id="anime_name_id").text
-            episodes: dict[int, Episode] = {index: [(episode.attrs.get("title") or "No title!"), episode.attrs.get("ep_id"), int(episode.attrs.get("value"))] for index, episode in enumerate(episodes_list.findChildren(recursive=False))}
+
+            episodes: dict[int, Episode] = {}
+            for index, episode in enumerate(episodes_list.findChildren(recursive=False)):
+                if episode.attrs.get("value") is not None and episode.attrs.get("value").isnumeric():
+                    episodes[index] = (episode.attrs.get("title") or "No title!", episode.attrs.get("ep_id"), int(episode.attrs.get("value")))
 
             self.no_episodes = len(episodes)
 
             size_getters = []
             for episode in episodes:
                 if episodes[episode][2] == 0:
+                    self.errored_episodes[-1] = (0, "Episode is zero episode (trailer)!", None)
                     self.no_episodes -= 1
                     continue
                 
                 try:
                     json_data = json.loads(requests.get(OA_PLAYER_BASE_URL + episodes[episode][1], proxies={"http": random.choice(self.proxies)}, headers=headers).content.decode("utf-8"))
-                    qualities = {f"{quality['res']}p": quality["src"] for quality in json_data}
+                    qualities = {}
+                    for quality in json_data:
+                        if "cda.pl" in quality["src"]:
+                            qualities[f"{quality['res']}p"] = quality["src"]
+
+                    if qualities == {}:
+                        self.errored_episodes[episode] = (episodes[episode][2], "No CDA URL found!", OA_PLAYER_BASE_URL + episodes[episode][1])
+                        self.no_episodes -= 1
+                        continue
+
                     self.episodes[episode] = Episode(self, episodes[episode][0], episodes[episode][1], qualities, episodes[episode][2])
 
                     quality = self.quality
@@ -462,6 +493,7 @@ class Series:
                     self.episodes[episode].set_output(self.output_directory, self.title_scheme)
                     self.episodes[episode].set_quality(quality)
                 except:
+                    self.errored_episodes[episode] = (episodes[episode][2], "Another error occured!", OA_PLAYER_BASE_URL + episodes[episode][1])
                     self.no_episodes -= 1
 
             for getter in size_getters:
@@ -476,8 +508,9 @@ class Series:
 
     def start_downloader(self) -> List[threading.Thread]:
         global timer
-        self.timer_start_download = timer       
+        self.timer_start_download = timer
         async def downloader():
+            global lost_chunks
             def get_first_nonignored_episode() -> int:
                 for episode in self.episodes:
                     if not self.episodes[episode].ignore:
@@ -517,6 +550,7 @@ class Series:
                             try:
                                 data = requests.get(self.episodes[key].get_raw_url(), headers={"Range": f"bytes={chunk_range[0]}-{chunk_range[1] - 1}"}, proxies={"http": random.choice(self.proxies)}, timeout=10).content
                             except:
+                                lost_chunks += 1
                                 await asyncio.sleep(1)
 
                         self.episodes[key].downloaded += len(data)
@@ -584,6 +618,10 @@ class Series:
             message += f"\n\tDownloading to {Fore.LIGHT_GRAY}\"{Fore.ORANGE}" + str(pathlib.Path(self.output_directory).resolve()).replace("\\", Fore.RED + f" >> " + Fore.ORANGE) + f"{Fore.LIGHT_GRAY}\"{Color.RESET} directory.\n"
             message += f"\n\t{Fore.ORANGE}Download progress: {Color.RESET}[" + make_progressbar(self.total_downloaded, nonignored_size, length=100) + f"{Color.RESET}] {Fore.GREEN}{self.total_downloaded / (nonignored_size or 1) * 100:.2f}{Color.RESET}% {Fore.GREEN}{convert_size(self.total_downloaded)}{Color.RESET}/{Fore.BLUE}{convert_size(nonignored_size)}{Color.RESET}"
             message += f"\n\t{Fore.ORANGE}ETA: {Color.RESET} [{Fore.MAGENTA}{calculate_eta()}{Color.RESET}]\n"
+            if len(self.errored_episodes) > 0:
+                message += f"\n\t{Fore.RED}Following episodes errored out and will not be downloaded:{Color.RESET}"
+                for episode in self.errored_episodes.values():
+                    message += f"\n\t\t{Fore.RED}Ep. {f'0{episode[0]}'[-2:]}: {episode[1]}{Color.RESET}; URL: {Fore.MAGENTA}{episode[2]}{Color.RESET}"
             message += "\n\nFollowing episodes are being downloaded:"
 
             item_index = 1
@@ -750,6 +788,25 @@ async def main():
             global timer
             seconds_to_finish = int((1 - download_progress) / (download_progress or 1) * timer)
             return str(timedelta(seconds=seconds_to_finish))
+        
+        def seconds_to_human_readable(seconds: int):
+            out = ""
+            if seconds >= 86400:
+                out += f"{seconds // 86400}d "
+                seconds %= 86400
+            
+            if seconds >= 3600:
+                out += f"{seconds // 3600}h "
+                seconds %= 3600
+
+            if seconds >= 60:
+                out += f"{seconds // 60}m "
+                seconds %= 60
+
+            if seconds > 0:
+                out += f"{seconds}s"
+            
+            return out.strip()
 
         
         total_size = 0
@@ -759,18 +816,42 @@ async def main():
             total_size += tsize
             downloaded_size += dsize
         
-        global timer, last_downloaded_amount, last_round_speed, speed_already_calculated
-        if timer % SPEED_TIMER_ROUND == 0 and not speed_already_calculated:
+        global timer, lost_chunks, last_downloaded1_amount, last_downloaded2_amount, last_downloaded3_amount, last_downloaded4_amount, last_downloaded5_amount, last_round1_speed, last_round2_speed, last_round3_speed, last_round4_speed, last_round5_speed, speed_already_calculated
+        if timer % SPEED_TIMER_ROUND1 == 0 and not speed_already_calculated:
+            last_round1_speed = (downloaded_size - last_downloaded1_amount) / SPEED_TIMER_ROUND1
+            last_downloaded1_amount = downloaded_size
+
+        if timer % SPEED_TIMER_ROUND2 == 0 and not speed_already_calculated:
+            last_round2_speed = (downloaded_size - last_downloaded2_amount) / SPEED_TIMER_ROUND2
+            last_downloaded2_amount = downloaded_size
+
+        if timer % SPEED_TIMER_ROUND3 == 0 and not speed_already_calculated:
+            last_round3_speed = (downloaded_size - last_downloaded3_amount) / SPEED_TIMER_ROUND3
+            last_downloaded3_amount = downloaded_size
+
+        if timer % SPEED_TIMER_ROUND4 == 0 and not speed_already_calculated:
+            last_round4_speed = (downloaded_size - last_downloaded4_amount) / SPEED_TIMER_ROUND4
+            last_downloaded4_amount = downloaded_size
+
+        if timer % SPEED_TIMER_ROUND5 == 0 and not speed_already_calculated:
+            last_round5_speed = (downloaded_size - last_downloaded5_amount) / SPEED_TIMER_ROUND5
+            last_downloaded5_amount = downloaded_size
+
+        if any([timer % round_time == 0 for round_time in [SPEED_TIMER_ROUND1, SPEED_TIMER_ROUND2, SPEED_TIMER_ROUND3, SPEED_TIMER_ROUND4, SPEED_TIMER_ROUND5]]):
             speed_already_calculated = True
-            last_round_speed = (downloaded_size - last_downloaded_amount) / SPEED_TIMER_ROUND
-            last_downloaded_amount = downloaded_size
-        elif timer % SPEED_TIMER_ROUND != 0:
+        else:
             speed_already_calculated = False
 
         return f"{Fore.ORANGE}Running for{Color.RESET}: {Fore.MAGENTA}{str(timedelta(seconds=timer))}\n" + \
         f"{Fore.ORANGE}Total progress{Color.RESET}: {Color.RESET}[{make_progressbar(downloaded_size, total_size, length=130)}{Color.RESET}] {Fore.GREEN}{downloaded_size / (total_size or 1) * 100:.2f}{Color.RESET}% {Fore.GREEN}{convert_size(downloaded_size)}{Color.RESET}/{Fore.BLUE}{convert_size(total_size)}{Color.RESET}\n" + \
         f"{Fore.ORANGE}ETA{Color.RESET}: {Color.RESET}[{Fore.MAGENTA}{calculate_eta(downloaded_size / (total_size or 1))}{Color.RESET}]\n" + \
-        f"Average download speed: {Fore.GREEN}{convert_size(downloaded_size / (timer or 1))}/s{Color.RESET} | Average download speed in last {SPEED_TIMER_ROUND}s: {Fore.GREEN}{convert_size(last_round_speed)}/s{Color.RESET}"
+        f"{Fore.ORANGE}Average download speed{Color.RESET}: {Fore.GREEN}{convert_size(downloaded_size / (timer or 1))}/s{Color.RESET}; " +\
+        f"{Fore.ORANGE}In last {seconds_to_human_readable(SPEED_TIMER_ROUND1)}{Color.RESET}: {Fore.GREEN}{convert_size(last_round1_speed if last_round1_speed > 0 else downloaded_size / (timer or 1))}/s{Color.RESET};" +\
+        f"{Fore.ORANGE} {seconds_to_human_readable(SPEED_TIMER_ROUND2)}{Color.RESET}: {Fore.GREEN}{convert_size(last_round2_speed if last_round2_speed > 0 else downloaded_size / (timer or 1))}/s{Color.RESET};" +\
+        f"{Fore.ORANGE} {seconds_to_human_readable(SPEED_TIMER_ROUND3)}{Color.RESET}: {Fore.GREEN}{convert_size(last_round3_speed if last_round3_speed > 0 else downloaded_size / (timer or 1))}/s{Color.RESET};" +\
+        f"{Fore.ORANGE} {seconds_to_human_readable(SPEED_TIMER_ROUND4)}{Color.RESET}: {Fore.GREEN}{convert_size(last_round4_speed if last_round4_speed > 0 else downloaded_size / (timer or 1))}/s{Color.RESET};" +\
+        f"{Fore.ORANGE} {seconds_to_human_readable(SPEED_TIMER_ROUND5)}{Color.RESET}: {Fore.GREEN}{convert_size(last_round5_speed if last_round5_speed > 0 else downloaded_size / (timer or 1))}/s{Color.RESET}.\n" +\
+        (f"{Fore.ORANGE}Dropped a total of {Fore.RED}{lost_chunks}{Fore.ORANGE} chunks{Color.RESET}\n" if lost_chunks > 0 else "")
 
     console_logger.set_message(6, lambda: get_total_download_progress_and_speed())
 
@@ -793,9 +874,27 @@ async def main():
         series.start_fetcher()
 
     for series in series_objects:
-        console_logger.set_message(7, lambda: f"\nDownloading series {series_objects.index(series) + 1} out of {len(series_objects)} ({Fore.LIGHT_GRAY}\"{Fore.MINT}{series.series_title}{Fore.LIGHT_GRAY}\"{Color.RESET})...")
+        console_logger.set_message(7, lambda: f"\nDownloading series {series_objects.index(series) + 1} out of {len(series_objects)} ({Fore.LIGHT_GRAY}\"{Fore.MINT}{series.series_title}{Fore.LIGHT_GRAY}\"{Color.RESET})...", True)
         for thread in series.start_downloader():
             thread.join()
+
+    console_logger.clear()
+
+    nodowload = {}
+    errored_episodes_count = 0
+    for series in series_objects:
+        nodowload[series.series_title] = series.errored_episodes
+        errored_episodes_count += len(series.errored_episodes)
+    
+    if errored_episodes_count > 0:
+        console_logger.set_message(0, f"A total of {Fore.RED}{errored_episodes_count}{Color.RESET} episodes failed to download!")
+
+    for index, item in enumerate(nodowload.items()):
+        series_title, episodes = item
+        out = f"Series \"{Fore.MINT}{series_title}{Color.RESET}\" failed to download {Fore.RED}{len(episodes)}{Color.RESET} episodes:\n"
+        for episode in episodes.values():
+            out += f"{Fore.RED}Episode {episode[0]}: {episode[1]}{Color.RESET}; URL: {Fore.MAGENTA}{episode[2]}{Color.RESET}\n"
+        console_logger.set_message(index + 1, out)
 
     console_logger.set_message(1000, "\n\nAll done!\n\n\n")
         
@@ -808,4 +907,3 @@ if __name__ == "__main__":
 
 # TODO: Check if enough space is available before downloading
 # TODO: Login using creds instead of hand-copying cookies
-# TODO: Create ETA for entire content that will be downloaded (all series)
